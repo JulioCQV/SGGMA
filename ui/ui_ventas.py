@@ -3,6 +3,7 @@ ui/ui_ventas.py
 Módulo de Ventas: selección de cliente, carrito temporal y confirmación.
 
 - El precio de venta se toma SIEMPRE de la base de datos (no es editable).
+- El método de pago (Efectivo, Tarjeta o SINPE) se elige antes de confirmar y se guarda en la venta.
 - El carrito vive en memoria; no toca la BD ni el inventario hasta "Confirmar Venta",
   que llama a servicios.registrar_venta (transacción con COMMIT / ROLLBACK).
 """
@@ -14,6 +15,8 @@ import servicios
 from servicios import ErrorNegocio
 
 CLIENTE_GENERAL = "Cliente General"
+METODOS_PAGO = list(servicios.METODOS_PAGO)          # Efectivo, Tarjeta, SINPE
+METODO_PAGO_INICIAL = servicios.METODO_PAGO_POR_DEFECTO
 
 
 def abrir_ventana(padre, conexion):
@@ -39,6 +42,7 @@ class VentanaVentas(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self.cerrar)
 
         self.var_cliente = tk.StringVar(value=CLIENTE_GENERAL)
+        self.var_metodo_pago = tk.StringVar(value=METODO_PAGO_INICIAL)
         self.var_producto = tk.StringVar()
         self.var_cantidad = tk.StringVar(value="1")
         self.var_precio = tk.StringVar(value="Precio unitario: -")
@@ -117,6 +121,11 @@ class VentanaVentas(tk.Toplevel):
         ttk.Label(pie, text="Total a pagar:", style="Total.TLabel").pack(side="left")
         ttk.Label(pie, textvariable=self.var_total, style="Total.TLabel").pack(side="left", padx=10)
         ttk.Button(pie, text="Confirmar Venta", command=self.confirmar_venta).pack(side="right")
+        # Método de pago (solo lectura: se elige de la lista, no se escribe)
+        self.combo_metodo_pago = ttk.Combobox(pie, textvariable=self.var_metodo_pago,
+                                              values=METODOS_PAGO, state="readonly", width=12)
+        self.combo_metodo_pago.pack(side="right", padx=(0, 16))
+        ttk.Label(pie, text="Método de pago:").pack(side="right", padx=(0, 6))
 
     # ------------------------------------------------------------------
     # Listas desplegables
@@ -254,28 +263,32 @@ class VentanaVentas(tk.Toplevel):
             messagebox.showwarning("Venta", str(error), parent=self)
             return
 
-        if not messagebox.askyesno(
-                "Confirmar venta",
-                f"Cliente: {self.var_cliente.get()}\nTotal: {self.var_total.get()}\n\n¿Registrar la venta?",
-                parent=self):
+        if not messagebox.askyesno("Confirmar venta", f"¿Registrar la venta por {self.var_total.get()}?",
+                                   parent=self):
             return
 
         items = [(id_producto, linea["cantidad"]) for id_producto, linea in self.carrito.items()]
         id_cliente = self.mapa_clientes.get(self.var_cliente.get())
         try:
-            id_venta = servicios.registrar_venta(self.conexion, items, id_cliente)
+            id_venta = servicios.registrar_venta(self.conexion, items, id_cliente,
+                                                 metodo_pago=self.var_metodo_pago.get())
         except ErrorNegocio as error:
             # La transacción ya hizo ROLLBACK: el inventario no cambió.
             messagebox.showerror("No se pudo registrar la venta", str(error), parent=self)
             self.recargar_combos()
             return
 
-        messagebox.showinfo("Venta registrada",
-                            f"Venta N.º {id_venta} registrada correctamente.\nTotal: {self.var_total.get()}",
-                            parent=self)
+        # La venta ya quedó registrada; ahora se genera el ticket (.txt en la carpeta del proyecto).
+        try:
+            servicios.generar_ticket_venta(self.conexion, id_venta)
+            messagebox.showinfo("Venta", "Venta registrada. Ticket generado.", parent=self)
+        except ErrorNegocio as error:
+            messagebox.showwarning("Venta", f"Venta registrada. No se pudo generar el ticket.\n{error}",
+                                   parent=self)
         self.carrito.clear()
         self._actualizar_carrito()
         self.var_cliente.set(CLIENTE_GENERAL)
+        self.var_metodo_pago.set(METODO_PAGO_INICIAL)   # cada venta empieza en Efectivo
         self.recargar_combos()   # el stock cambió
 
     def cerrar(self):

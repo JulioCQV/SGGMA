@@ -2,6 +2,9 @@
 ui/ui_productos.py
 Módulo de Productos: formulario de registro/edición + tabla de listado.
 Toda la lógica de negocio está en servicios.py; aquí solo hay interfaz.
+
+- Precio de venta = costo + impuesto + utilidad (botón "Calcular"); se puede editar a mano.
+- Las filas con existencia <= stock mínimo se pintan de rojo.
 """
 
 import tkinter as tk
@@ -9,9 +12,15 @@ from tkinter import ttk, messagebox
 
 import servicios
 from servicios import ErrorNegocio
+from ui import formato
 
 FILTROS_ESTADO = {"Todos": None, "Activos": "activo", "Inactivos": "inactivo"}
 SIN_PROVEEDOR = "(Sin proveedor)"
+
+# Valores iniciales del formulario (los mismos que usa la base de datos).
+IMPUESTO_INICIAL = f"{servicios.IMPUESTO_POR_DEFECTO:g}"
+UTILIDAD_INICIAL = f"{servicios.UTILIDAD_POR_DEFECTO:g}"
+STOCK_MINIMO_INICIAL = str(servicios.STOCK_MINIMO_POR_DEFECTO)
 
 
 def abrir_ventana(padre, conexion):
@@ -21,6 +30,30 @@ def abrir_ventana(padre, conexion):
 
 def _formato_dinero(valor):
     return f"{valor:,.2f}"
+
+
+def _solo_digitos(texto_nuevo):
+    return texto_nuevo == "" or (texto_nuevo.isdigit() and len(texto_nuevo) <= 9)
+
+
+def _solo_decimal(texto_nuevo):
+    """Permite dígitos y un separador decimal (punto o coma)."""
+    if texto_nuevo == "":
+        return True
+    if len(texto_nuevo) > 12:
+        return False
+    texto = texto_nuevo.replace(",", ".")
+    return (texto.count(".") <= 1 and texto.replace(".", "").isdigit()) or texto == "."
+
+
+def _solo_fecha(texto_nuevo):
+    """Fecha DD/MM/AAAA: solo dígitos y barras, máximo 10 caracteres."""
+    return len(texto_nuevo) <= 10 and all(c.isdigit() or c == "/" for c in texto_nuevo)
+
+
+def _decimal(texto):
+    """Acepta la coma como separador decimal."""
+    return texto.strip().replace(",", ".")
 
 
 def _construir_mapa(filas, campo_id, campo_nombre):
@@ -50,14 +83,17 @@ class VentanaProductos(tk.Toplevel):
         self._extra_proveedor = None      # (id, nombre) de un proveedor inactivo en edición
 
         self.title("Productos")
-        self.geometry("1000x680")
-        self.minsize(860, 560)
+        self.geometry("1080x720")
+        self.minsize(900, 620)
 
         self.var_nombre = tk.StringVar()
         self.var_categoria = tk.StringVar()
         self.var_precio_compra = tk.StringVar()
+        self.var_impuesto = tk.StringVar(value=IMPUESTO_INICIAL)
+        self.var_utilidad = tk.StringVar(value=UTILIDAD_INICIAL)
         self.var_precio_venta = tk.StringVar()
         self.var_existencia = tk.StringVar(value="0")
+        self.var_stock_minimo = tk.StringVar(value=STOCK_MINIMO_INICIAL)
         self.var_proveedor = tk.StringVar(value=SIN_PROVEEDOR)
         self.var_vencimiento = tk.StringVar()
         self.var_busqueda = tk.StringVar()
@@ -79,6 +115,9 @@ class VentanaProductos(tk.Toplevel):
         for columna in (1, 3):
             self.marco_form.columnconfigure(columna, weight=1, uniform="campos")
 
+        validar_decimal = (self.register(_solo_decimal), "%P")
+        validar_entero = (self.register(_solo_digitos), "%P")
+
         # Fila 0: nombre y categoría
         ttk.Label(self.marco_form, text="Nombre (*):").grid(row=0, column=0, sticky="w", pady=4)
         self.entrada_nombre = ttk.Entry(self.marco_form, textvariable=self.var_nombre)
@@ -89,39 +128,57 @@ class VentanaProductos(tk.Toplevel):
                                             state="readonly", postcommand=self.recargar_combos)
         self.combo_categoria.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=4)
 
-        # Fila 1: precios
+        # Fila 1: precio de compra y precio de venta (con botón Calcular)
         ttk.Label(self.marco_form, text="Precio compra (*):").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(self.marco_form, textvariable=self.var_precio_compra).grid(
-            row=1, column=1, sticky="ew", padx=(8, 16), pady=4)
+        ttk.Entry(self.marco_form, textvariable=self.var_precio_compra, validate="key",
+                  validatecommand=validar_decimal).grid(row=1, column=1, sticky="ew", padx=(8, 16), pady=4)
 
         ttk.Label(self.marco_form, text="Precio venta (*):").grid(row=1, column=2, sticky="w", pady=4)
-        ttk.Entry(self.marco_form, textvariable=self.var_precio_venta).grid(
-            row=1, column=3, sticky="ew", padx=(8, 0), pady=4)
+        marco_precio = ttk.Frame(self.marco_form)
+        marco_precio.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=4)
+        marco_precio.columnconfigure(0, weight=1)
+        ttk.Entry(marco_precio, textvariable=self.var_precio_venta, validate="key",
+                  validatecommand=validar_decimal).grid(row=0, column=0, sticky="ew")
+        ttk.Button(marco_precio, text="Calcular", width=9, command=self.calcular_precio).grid(
+            row=0, column=1, padx=(6, 0))
 
-        # Fila 2: existencia y proveedor
+        # Fila 2: impuesto y utilidad
+        ttk.Label(self.marco_form, text="% Impuesto:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(self.marco_form, textvariable=self.var_impuesto, validate="key",
+                  validatecommand=validar_decimal).grid(row=2, column=1, sticky="ew", padx=(8, 16), pady=4)
+
+        ttk.Label(self.marco_form, text="% Utilidad:").grid(row=2, column=2, sticky="w", pady=4)
+        ttk.Entry(self.marco_form, textvariable=self.var_utilidad, validate="key",
+                  validatecommand=validar_decimal).grid(row=2, column=3, sticky="ew", padx=(8, 0), pady=4)
+
+        # Fila 3: existencia y stock mínimo
         self.etiqueta_existencia = ttk.Label(self.marco_form, text="Existencia inicial (*):")
-        self.etiqueta_existencia.grid(row=2, column=0, sticky="w", pady=4)
-        self.entrada_existencia = ttk.Entry(self.marco_form, textvariable=self.var_existencia)
-        self.entrada_existencia.grid(row=2, column=1, sticky="ew", padx=(8, 16), pady=4)
+        self.etiqueta_existencia.grid(row=3, column=0, sticky="w", pady=4)
+        self.entrada_existencia = ttk.Entry(self.marco_form, textvariable=self.var_existencia,
+                                            validate="key", validatecommand=validar_entero)
+        self.entrada_existencia.grid(row=3, column=1, sticky="ew", padx=(8, 16), pady=4)
 
-        ttk.Label(self.marco_form, text="Proveedor habitual:").grid(row=2, column=2, sticky="w", pady=4)
+        ttk.Label(self.marco_form, text="Stock mínimo:").grid(row=3, column=2, sticky="w", pady=4)
+        ttk.Entry(self.marco_form, textvariable=self.var_stock_minimo, validate="key",
+                  validatecommand=validar_entero).grid(row=3, column=3, sticky="ew", padx=(8, 0), pady=4)
+
+        # Fila 4: proveedor y vencimiento
+        ttk.Label(self.marco_form, text="Proveedor habitual:").grid(row=4, column=0, sticky="w", pady=4)
         self.combo_proveedor = ttk.Combobox(self.marco_form, textvariable=self.var_proveedor,
                                             state="readonly", postcommand=self.recargar_combos)
-        self.combo_proveedor.grid(row=2, column=3, sticky="ew", padx=(8, 0), pady=4)
+        self.combo_proveedor.grid(row=4, column=1, sticky="ew", padx=(8, 16), pady=4)
 
-        # Fila 3: vencimiento
-        ttk.Label(self.marco_form, text="Fecha vencimiento:").grid(row=3, column=0, sticky="w", pady=4)
-        ttk.Entry(self.marco_form, textvariable=self.var_vencimiento).grid(
-            row=3, column=1, sticky="ew", padx=(8, 16), pady=4)
-        ttk.Label(self.marco_form, text="Formato AAAA-MM-DD (opcional)",
-                  foreground="gray").grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
+        ttk.Label(self.marco_form, text="Vencimiento:").grid(row=4, column=2, sticky="w", pady=4)
+        ttk.Entry(self.marco_form, textvariable=self.var_vencimiento, validate="key",
+                  validatecommand=(self.register(_solo_fecha), "%P")).grid(
+            row=4, column=3, sticky="ew", padx=(8, 0), pady=4)
 
-        # Botones
+        # Fila 5: botones
         botones = ttk.Frame(self.marco_form)
-        botones.grid(row=4, column=0, columnspan=4, sticky="e", pady=(8, 0))
+        botones.grid(row=5, column=0, columnspan=4, sticky="e", pady=(10, 0))
         self.boton_guardar = ttk.Button(botones, text="Guardar", command=self.guardar)
         self.boton_guardar.pack(side="left", padx=4)
-        ttk.Button(botones, text="Limpiar", command=self.limpiar_formulario).pack(side="left", padx=4)
+        ttk.Button(botones, text="Nuevo / Limpiar", command=self.limpiar_formulario).pack(side="left", padx=4)
         self.boton_desactivar = ttk.Button(botones, text="Desactivar", command=self.desactivar,
                                            state="disabled")
         self.boton_desactivar.pack(side="left", padx=4)
@@ -146,18 +203,19 @@ class VentanaProductos(tk.Toplevel):
         combo.pack(side="left", padx=6)
         combo.bind("<<ComboboxSelected>>", lambda _e: self.cargar_tabla())
 
-        columnas = ("id", "nombre", "categoria", "p_compra", "p_venta",
-                    "existencia", "proveedor", "vencimiento", "estado")
-        encabezados = (("id", "ID", 45, "center"), ("nombre", "Nombre", 170, "w"),
-                       ("categoria", "Categoría", 110, "w"), ("p_compra", "P. Compra", 80, "e"),
-                       ("p_venta", "P. Venta", 80, "e"), ("existencia", "Existencia", 75, "center"),
-                       ("proveedor", "Proveedor", 120, "w"), ("vencimiento", "Vence", 90, "center"),
-                       ("estado", "Estado", 70, "center"))
+        columnas = ("id", "nombre", "categoria", "p_compra", "p_venta", "existencia",
+                    "stock_min", "proveedor", "vencimiento", "estado")
+        encabezados = (("id", "ID", 40, "center"), ("nombre", "Nombre", 160, "w"),
+                       ("categoria", "Categoría", 100, "w"), ("p_compra", "P. Compra", 80, "e"),
+                       ("p_venta", "P. Venta", 80, "e"), ("existencia", "Existencia", 70, "center"),
+                       ("stock_min", "Stock mín.", 70, "center"), ("proveedor", "Proveedor", 110, "w"),
+                       ("vencimiento", "Vence", 85, "center"), ("estado", "Estado", 65, "center"))
         self.tabla = ttk.Treeview(marco, columns=columnas, show="headings", selectmode="browse")
         for columna, titulo, ancho, alineacion in encabezados:
             self.tabla.heading(columna, text=titulo)
             self.tabla.column(columna, width=ancho, anchor=alineacion)
         self.tabla.tag_configure("inactivo", foreground="gray")
+        self.tabla.tag_configure("stock_bajo", foreground="#b00020", background="#fde8e8")
         self.tabla.grid(row=1, column=0, sticky="nsew")
 
         scroll = ttk.Scrollbar(marco, orient="vertical", command=self.tabla.yview)
@@ -182,9 +240,7 @@ class VentanaProductos(tk.Toplevel):
         self.mapa_categorias = _construir_mapa(categorias, "id_categoria", "nombre")
         self.combo_categoria["values"] = list(self.mapa_categorias)
 
-        # El CRUD de proveedores se agrega en otra fase: si aún no existe, la lista queda vacía.
-        funcion_proveedores = getattr(servicios, "listar_proveedores", None)
-        proveedores = [dict(p) for p in funcion_proveedores(self.conexion)] if funcion_proveedores else []
+        proveedores = [dict(p) for p in servicios.listar_proveedores(self.conexion)]
         if self._extra_proveedor and self._extra_proveedor[0] not in [p["id_proveedor"] for p in proveedores]:
             proveedores.append({"id_proveedor": self._extra_proveedor[0],
                                 "nombre": self._extra_proveedor[1]})
@@ -202,6 +258,18 @@ class VentanaProductos(tk.Toplevel):
     # ------------------------------------------------------------------
     # Acciones
     # ------------------------------------------------------------------
+    def calcular_precio(self):
+        """Autocompleta 'Precio venta' = costo + impuesto + utilidad (editable después)."""
+        try:
+            precio = servicios.calcular_precio_sugerido(
+                _decimal(self.var_precio_compra.get()),
+                _decimal(self.var_impuesto.get()),
+                _decimal(self.var_utilidad.get()))
+        except ErrorNegocio as error:
+            messagebox.showwarning("No se pudo calcular", str(error), parent=self)
+            return
+        self.var_precio_venta.set(f"{precio:.2f}")
+
     def cargar_tabla(self):
         """Recarga el Treeview según el filtro de estado y la búsqueda."""
         for fila in self.tabla.get_children():
@@ -214,12 +282,17 @@ class VentanaProductos(tk.Toplevel):
         )
         for p in productos:
             self.filas_por_id[p["id_producto"]] = p
-            etiqueta = () if p["estado"] == "activo" else ("inactivo",)
+            if p["estado"] != "activo":
+                etiqueta = ("inactivo",)
+            elif p["existencia"] <= p["stock_minimo"]:
+                etiqueta = ("stock_bajo",)        # alerta: stock en o bajo el mínimo
+            else:
+                etiqueta = ()
             self.tabla.insert("", "end", iid=str(p["id_producto"]), tags=etiqueta, values=(
                 p["id_producto"], p["nombre"], p["categoria"],
                 _formato_dinero(p["precio_compra"]), _formato_dinero(p["precio_venta"]),
-                p["existencia"], p["proveedor"] or "", p["fecha_vencimiento"] or "",
-                p["estado"].capitalize()))
+                p["existencia"], p["stock_minimo"], p["proveedor"] or "",
+                formato.formatear_fecha(p["fecha_vencimiento"]), p["estado"].capitalize()))
 
     def al_seleccionar_fila(self, _evento=None):
         seleccion = self.tabla.selection()
@@ -237,9 +310,12 @@ class VentanaProductos(tk.Toplevel):
         self.var_nombre.set(producto["nombre"])
         self.var_categoria.set(self._texto_de_id(self.mapa_categorias, producto["id_categoria"]))
         self.var_precio_compra.set(f"{producto['precio_compra']:.2f}")
+        self.var_impuesto.set(f"{producto['porcentaje_impuesto']:g}")
+        self.var_utilidad.set(f"{producto['porcentaje_utilidad']:g}")
         self.var_precio_venta.set(f"{producto['precio_venta']:.2f}")
+        self.var_stock_minimo.set(str(producto["stock_minimo"]))
         self.var_proveedor.set(self._texto_de_id(self.mapa_proveedores, producto["id_proveedor"]) or SIN_PROVEEDOR)
-        self.var_vencimiento.set(producto["fecha_vencimiento"] or "")
+        self.var_vencimiento.set(formato.formatear_fecha(producto["fecha_vencimiento"]))
 
         # En edición la existencia es de solo lectura: cambia únicamente con compras y ventas.
         self.var_existencia.set(str(producto["existencia"]))
@@ -258,8 +334,11 @@ class VentanaProductos(tk.Toplevel):
         self.var_nombre.set("")
         self.var_categoria.set("")
         self.var_precio_compra.set("")
+        self.var_impuesto.set(IMPUESTO_INICIAL)
+        self.var_utilidad.set(UTILIDAD_INICIAL)
         self.var_precio_venta.set("")
         self.var_existencia.set("0")
+        self.var_stock_minimo.set(STOCK_MINIMO_INICIAL)
         self.var_proveedor.set(SIN_PROVEEDOR)
         self.var_vencimiento.set("")
         self.entrada_existencia.configure(state="normal")
@@ -279,20 +358,27 @@ class VentanaProductos(tk.Toplevel):
             return
         id_proveedor = self.mapa_proveedores.get(self.var_proveedor.get())
         # Se acepta la coma como separador decimal.
-        precio_compra = self.var_precio_compra.get().replace(",", ".")
-        precio_venta = self.var_precio_venta.get().replace(",", ".")
+        precio_compra = _decimal(self.var_precio_compra.get())
+        precio_venta = _decimal(self.var_precio_venta.get())    # vacío => precio sugerido
+        impuesto = _decimal(self.var_impuesto.get())
+        utilidad = _decimal(self.var_utilidad.get())
 
         try:
+            vencimiento = formato.a_fecha_iso(self.var_vencimiento.get())   # DD/MM/AAAA -> BD
             if self.id_seleccionado is None:
                 servicios.crear_producto(
                     self.conexion, self.var_nombre.get(), id_categoria, precio_compra,
                     precio_venta, self.var_existencia.get(), id_proveedor,
-                    self.var_vencimiento.get())
+                    vencimiento,
+                    porcentaje_impuesto=impuesto, porcentaje_utilidad=utilidad,
+                    stock_minimo=self.var_stock_minimo.get())
                 mensaje = "Producto registrado correctamente."
             else:
                 servicios.modificar_producto(
                     self.conexion, self.id_seleccionado, self.var_nombre.get(), id_categoria,
-                    precio_compra, precio_venta, id_proveedor, self.var_vencimiento.get())
+                    precio_compra, precio_venta, id_proveedor, vencimiento,
+                    porcentaje_impuesto=impuesto, porcentaje_utilidad=utilidad,
+                    stock_minimo=self.var_stock_minimo.get())
                 mensaje = "Producto actualizado correctamente."
         except ErrorNegocio as error:
             messagebox.showwarning("No se pudo guardar", str(error), parent=self)

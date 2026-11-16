@@ -68,20 +68,7 @@ def transaccion(conexion):
         raise
 
 
-# ---------------------------------------------------------------------------
-# Esquema
-# ---------------------------------------------------------------------------
-# Notas de diseño (todas salen del ERS):
-#  * Borrado lógico: categorias, proveedores, productos y clientes tienen la
-#    columna `estado` ('activo' / 'inactivo'). Nunca se hace DELETE sobre ellas.
-#  * Compras y ventas NO se borran: el módulo Admin (CRUD 5) las ANULA
-#    (anulada = 1) y revierte el inventario, conservando el registro para auditoría.
-#  * Stock: CHECK (existencia >= 0) es la ÚLTIMA barrera a nivel de BD contra el
-#    stock negativo; servicios.py además valida antes de escribir.
-#  * Venta sin cliente = "cliente general" -> ventas.id_cliente puede ser NULL.
-#  * El precio de venta unitario y el costo unitario se COPIAN al detalle de la
-#    transacción (histórico), así cambiar el precio del producto después no
-#    altera ventas ni compras pasadas.
+
 ESQUEMA_SQL = """
 CREATE TABLE IF NOT EXISTS categorias (
     id_categoria   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +118,12 @@ CREATE TABLE IF NOT EXISTS productos (
     fecha_vencimiento  TEXT,                          -- 'YYYY-MM-DD' (opcional)
     estado             TEXT    NOT NULL DEFAULT 'activo'
                                CHECK (estado IN ('activo', 'inactivo')),
+    porcentaje_impuesto  REAL    NOT NULL DEFAULT 13.0
+                                 CHECK (porcentaje_impuesto >= 0 AND porcentaje_impuesto <= 100),
+    porcentaje_utilidad  REAL    NOT NULL DEFAULT 0.0
+                                 CHECK (porcentaje_utilidad >= 0),
+    stock_minimo         INTEGER NOT NULL DEFAULT 5
+                                 CHECK (stock_minimo >= 0),   -- alerta de stock bajo
     FOREIGN KEY (id_categoria) REFERENCES categorias  (id_categoria),
     FOREIGN KEY (id_proveedor) REFERENCES proveedores (id_proveedor),
     -- No dos productos con el mismo nombre en la misma categoría
@@ -163,6 +156,8 @@ CREATE TABLE IF NOT EXISTS ventas (
     id_cliente   INTEGER,                              -- NULL = cliente general
     total        REAL    NOT NULL CHECK (total >= 0),
     anulada      INTEGER NOT NULL DEFAULT 0 CHECK (anulada IN (0, 1)),  -- 1 = anulada (auditoría)
+    metodo_pago  TEXT    NOT NULL DEFAULT 'Efectivo'
+                         CHECK (metodo_pago IN ('Efectivo', 'Tarjeta', 'SINPE')),
     FOREIGN KEY (id_cliente) REFERENCES clientes (id_cliente)
 );
 
@@ -191,19 +186,31 @@ CREATE INDEX IF NOT EXISTS idx_detventas_producto    ON detalle_ventas  (id_prod
 """
 
 
-def _migrar_columna_anulada(conexion):
-    """
-    Bases de datos creadas ANTES de esta versión no tienen la columna `anulada`
-    (CREATE TABLE IF NOT EXISTS no modifica tablas existentes). Se agrega aquí,
-    conservando todos los datos; las transacciones antiguas quedan como no anuladas.
-    """
-    for tabla in ("ventas", "compras"):
-        columnas = [fila["name"] for fila in conexion.execute(f"PRAGMA table_info({tabla})")]
-        if "anulada" not in columnas:
-            conexion.execute(
-                f"ALTER TABLE {tabla} ADD COLUMN anulada INTEGER NOT NULL DEFAULT 0 "
-                "CHECK (anulada IN (0, 1))"
-            )
+# Columnas agregadas después de la primera versión: (tabla, columna, definición).
+# CREATE TABLE IF NOT EXISTS NO modifica tablas existentes, así que las bases creadas
+# antes de estos cambios las reciben aquí con ALTER TABLE, conservando todos los datos.
+COLUMNAS_NUEVAS = [
+    ("ventas", "anulada",
+     "INTEGER NOT NULL DEFAULT 0 CHECK (anulada IN (0, 1))"),
+    ("compras", "anulada",
+     "INTEGER NOT NULL DEFAULT 0 CHECK (anulada IN (0, 1))"),
+    ("ventas", "metodo_pago",
+     "TEXT NOT NULL DEFAULT 'Efectivo' CHECK (metodo_pago IN ('Efectivo', 'Tarjeta', 'SINPE'))"),
+    ("productos", "porcentaje_impuesto",
+     "REAL NOT NULL DEFAULT 13.0 CHECK (porcentaje_impuesto >= 0 AND porcentaje_impuesto <= 100)"),
+    ("productos", "porcentaje_utilidad",
+     "REAL NOT NULL DEFAULT 0.0 CHECK (porcentaje_utilidad >= 0)"),
+    ("productos", "stock_minimo",
+     "INTEGER NOT NULL DEFAULT 5 CHECK (stock_minimo >= 0)"),
+]
+
+
+def _migrar_columnas_nuevas(conexion):
+    """Agrega a una base antigua las columnas de COLUMNAS_NUEVAS que le falten."""
+    for tabla, columna, definicion in COLUMNAS_NUEVAS:
+        existentes = [fila["name"] for fila in conexion.execute(f"PRAGMA table_info({tabla})")]
+        if columna not in existentes:
+            conexion.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} {definicion}")
 
 
 def _migrar_restriccion_telefono(conexion):
@@ -241,7 +248,7 @@ def _migrar_restriccion_telefono(conexion):
 def crear_tablas(conexion):
     """Crea todas las tablas e índices si todavía no existen (y migra bases antiguas)."""
     conexion.executescript(ESQUEMA_SQL)
-    _migrar_columna_anulada(conexion)
+    _migrar_columnas_nuevas(conexion)
     _migrar_restriccion_telefono(conexion)
 
 

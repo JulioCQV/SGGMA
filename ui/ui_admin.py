@@ -17,6 +17,7 @@ from tkinter import ttk, messagebox
 
 import servicios
 from servicios import ErrorNegocio
+from ui import formato
 
 
 def abrir_ventana(padre, conexion):
@@ -196,11 +197,11 @@ class PestanaHistorial(ttk.Frame):
             self.tabla.delete(fila)
         self._limpiar_detalle()
         # El historial incluye las anuladas (auditoría); se distinguen por la columna Estado.
-        for t in self.cfg["listar"](self.conexion, self.var_busqueda.get()):
+        for t in self.cfg["listar"](self.conexion, formato.convertir_busqueda(self.var_busqueda.get())):
             anulada = bool(t["anulada"])
             self.tabla.insert("", "end", iid=str(t[self.cfg["campo_id"]]),
                               tags=("anulada",) if anulada else (), values=(
-                t[self.cfg["campo_id"]], t["fecha_hora"], t[self.cfg["campo_entidad"]],
+                t[self.cfg["campo_id"]], formato.formatear_fecha_hora(t["fecha_hora"]), t[self.cfg["campo_entidad"]],
                 _dinero(t["total"]), "ANULADA" if anulada else "Vigente"))
 
     def _limpiar_detalle(self):

@@ -28,10 +28,11 @@ MODULOS = [
     ("Clientes",    "ui_clientes"),
     ("Ventas",      "ui_ventas"),
     ("Compras",     "ui_compras"),
+    ("Cierre de Caja", "ui_cierre_caja"),
     ("Admin",       "ui_admin"),
 ]
 
-COLUMNAS = 3
+COLUMNAS = 4
 
 
 class VentanaPrincipal:
@@ -49,11 +50,11 @@ class VentanaPrincipal:
     # ------------------------------------------------------------------
     def _configurar_ventana(self):
         self.raiz.title("SGGMA - Sistema de Gestión de GeMMa Mini Abastecedor")
-        ancho, alto = 760, 520
+        ancho, alto = 980, 480
         x = (self.raiz.winfo_screenwidth() - ancho) // 2
         y = (self.raiz.winfo_screenheight() - alto) // 2
         self.raiz.geometry(f"{ancho}x{alto}+{x}+{y}")
-        self.raiz.minsize(640, 460)
+        self.raiz.minsize(820, 420)
         self.raiz.protocol("WM_DELETE_WINDOW", self._salir)
 
     def _configurar_estilos(self):
@@ -71,7 +72,7 @@ class VentanaPrincipal:
         ttk.Label(marco, text="Seleccione un módulo para comenzar",
                   style="Subtitulo.TLabel").pack(pady=(0, 18))
 
-        # Cuadrícula de botones: 3 columnas que se estiran con la ventana.
+        # Cuadrícula de botones: 4 columnas (2 filas) que se estiran con la ventana.
         cuadricula = ttk.Frame(marco)
         cuadricula.pack(fill="both", expand=True)
         for columna in range(COLUMNAS):
