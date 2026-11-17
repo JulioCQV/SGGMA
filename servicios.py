@@ -10,10 +10,12 @@ Convenciones:
 """
 
 import hmac
+import math
 import os
 import re
 import sqlite3
 import textwrap
+import unicodedata
 from datetime import datetime
 from database import transaccion, ESTADO_ACTIVO, ESTADO_INACTIVO
 
@@ -28,6 +30,8 @@ METODO_PAGO_POR_DEFECTO = "Efectivo"
 IMPUESTO_POR_DEFECTO = 13.0        # % (IVA)
 UTILIDAD_POR_DEFECTO = 0.0         # %
 STOCK_MINIMO_POR_DEFECTO = 5       # unidades
+ENTERO_MAXIMO_BD = 2**63 - 1       # límite de los enteros de SQLite
+_SIN_CAMBIOS = object()            # distingue un dato omitido de un valor vacío
 
 # Datos del ticket impreso
 NOMBRE_NEGOCIO = "GeMMa Mini Abastecedor"
@@ -56,9 +60,13 @@ def _texto_opcional(valor, nombre_campo, maximo):
 
 def _numero_no_negativo(valor, nombre_campo):
     try:
+        if isinstance(valor, bool):
+            raise ValueError
         numero = float(valor)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ErrorNegocio(f"'{nombre_campo}' debe ser un número válido.")
+    if not math.isfinite(numero):
+        raise ErrorNegocio(f"'{nombre_campo}' debe ser un número finito.")
     if numero < 0:
         raise ErrorNegocio(f"'{nombre_campo}' no puede ser negativo.")
     return round(numero, 2)
@@ -66,13 +74,18 @@ def _numero_no_negativo(valor, nombre_campo):
 
 def _entero(valor, nombre_campo, minimo):
     try:
-        if isinstance(valor, float) and not valor.is_integer():
+        if isinstance(valor, bool):
             raise ValueError
         numero = int(valor)
-    except (TypeError, ValueError):
+        # int() trunca valores como Decimal('1.5'); se deben rechazar.
+        if not isinstance(valor, str) and valor != numero:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
         raise ErrorNegocio(f"'{nombre_campo}' debe ser un número entero.")
     if numero < minimo:
         raise ErrorNegocio(f"'{nombre_campo}' debe ser mayor o igual a {minimo}.")
+    if numero > ENTERO_MAXIMO_BD:
+        raise ErrorNegocio(f"'{nombre_campo}' supera el máximo permitido.")
     return numero
 
 
@@ -101,9 +114,24 @@ def _filtro_estado(estado):
 # ===========================================================================
 # CATEGORÍAS
 # ===========================================================================
+def _normalizar_nombre(nombre):
+    """Compara nombres sin distinguir mayúsculas, conservando las tildes."""
+    return unicodedata.normalize("NFC", nombre.strip()).casefold()
+
+
+def _existe_categoria_con_nombre(conexion, nombre, excluir_id=None):
+    """Compara también mayúsculas españolas y Unicode compuesto/descompuesto."""
+    buscado = _normalizar_nombre(nombre)
+    return any(fila["id_categoria"] != excluir_id
+               and _normalizar_nombre(fila["nombre"]) == buscado
+               for fila in conexion.execute("SELECT id_categoria, nombre FROM categorias"))
+
+
 def crear_categoria(conexion, nombre, descripcion=None):
     nombre = _texto_obligatorio(nombre, "Nombre", 50)
     descripcion = _texto_opcional(descripcion, "Descripción", 200)
+    if _existe_categoria_con_nombre(conexion, nombre):
+        raise ErrorNegocio("Ya existe una categoría con ese nombre. Revise también las inactivas.")
     try:
         cursor = conexion.execute(
             "INSERT INTO categorias (nombre, descripcion) VALUES (?, ?)",
@@ -131,9 +159,12 @@ def obtener_categoria(conexion, id_categoria):
 
 
 def modificar_categoria(conexion, id_categoria, nombre, descripcion=None):
-    obtener_categoria(conexion, id_categoria)
+    categoria = obtener_categoria(conexion, id_categoria)
+    id_categoria = categoria["id_categoria"]
     nombre = _texto_obligatorio(nombre, "Nombre", 50)
     descripcion = _texto_opcional(descripcion, "Descripción", 200)
+    if _existe_categoria_con_nombre(conexion, nombre, excluir_id=id_categoria):
+        raise ErrorNegocio("Ya existe otra categoría con ese nombre. Revise también las inactivas.")
     try:
         conexion.execute(
             "UPDATE categorias SET nombre = ?, descripcion = ? WHERE id_categoria = ?",
@@ -200,7 +231,16 @@ def calcular_precio_sugerido(precio_compra, porcentaje_impuesto, porcentaje_util
     costo = _numero_no_negativo(precio_compra, "Precio de compra")
     impuesto = costo * _validar_porcentaje(porcentaje_impuesto, "Porcentaje de impuesto", 100) / 100
     utilidad = costo * _validar_porcentaje(porcentaje_utilidad, "Porcentaje de utilidad") / 100
-    return round(costo + impuesto + utilidad, 2)
+    return _numero_no_negativo(costo + impuesto + utilidad, "Precio sugerido")
+
+
+def _existe_producto_con_nombre(conexion, nombre, id_categoria, excluir_id=None):
+    buscado = _normalizar_nombre(nombre)
+    return any(fila["id_producto"] != excluir_id
+               and _normalizar_nombre(fila["nombre"]) == buscado
+               for fila in conexion.execute(
+                   "SELECT id_producto, nombre FROM productos WHERE id_categoria = ?",
+                   (id_categoria,)))
 
 
 def crear_producto(conexion, nombre, id_categoria, precio_compra, precio_venta,
@@ -225,6 +265,9 @@ def crear_producto(conexion, nombre, id_categoria, precio_compra, precio_venta,
     existencia = _entero(existencia_inicial, "Existencia inicial", 0)
     fecha_vencimiento = _validar_fecha(fecha_vencimiento)
     _validar_categoria_activa(conexion, id_categoria)
+    if _existe_producto_con_nombre(conexion, nombre, id_categoria):
+        raise ErrorNegocio("Ya existe un producto con ese nombre en la categoría seleccionada. "
+                           "Revise también los inactivos.")
     if id_proveedor:
         _validar_proveedor_activo(conexion, id_proveedor)
     else:
@@ -284,6 +327,7 @@ def modificar_producto(conexion, id_producto, nombre, id_categoria, precio_compr
     valor actual del producto. precio_venta None o vacío => precio sugerido.
     """
     actual = obtener_producto(conexion, id_producto)
+    id_producto = actual["id_producto"]
     nombre = _texto_obligatorio(nombre, "Nombre", 100)
     precio_compra = _numero_no_negativo(precio_compra, "Precio de compra")
     if porcentaje_impuesto is None:
@@ -300,6 +344,9 @@ def modificar_producto(conexion, id_producto, nombre, id_categoria, precio_compr
     else:
         precio_venta = _numero_no_negativo(precio_venta, "Precio de venta")
     fecha_vencimiento = _validar_fecha(fecha_vencimiento)
+    if _existe_producto_con_nombre(conexion, nombre, id_categoria, excluir_id=id_producto):
+        raise ErrorNegocio("Ya existe otro producto con ese nombre en la categoría seleccionada. "
+                           "Revise también los inactivos.")
     # Solo se exige categoría/proveedor activos si cambiaron respecto al actual.
     if id_categoria != actual["id_categoria"]:
         _validar_categoria_activa(conexion, id_categoria)
@@ -379,11 +426,10 @@ def _validar_datos_proveedor(nombre, telefono, nombre_contacto, correo, direccio
 
 
 def _existe_proveedor_con_nombre(conexion, nombre, excluir_id=None):
-    fila = conexion.execute(
-        "SELECT 1 FROM proveedores WHERE nombre = ? COLLATE NOCASE AND id_proveedor IS NOT ?",
-        (nombre, excluir_id),
-    ).fetchone()
-    return fila is not None
+    buscado = _normalizar_nombre(nombre)
+    return any(fila["id_proveedor"] != excluir_id
+               and _normalizar_nombre(fila["nombre"]) == buscado
+               for fila in conexion.execute("SELECT id_proveedor, nombre FROM proveedores"))
 
 
 def crear_proveedor(conexion, nombre, telefono, nombre_contacto=None, correo=None, direccion=None):
@@ -419,7 +465,7 @@ def obtener_proveedor(conexion, id_proveedor):
 
 def modificar_proveedor(conexion, id_proveedor, nombre, telefono,
                         nombre_contacto=None, correo=None, direccion=None):
-    obtener_proveedor(conexion, id_proveedor)
+    id_proveedor = obtener_proveedor(conexion, id_proveedor)["id_proveedor"]
     nombre, telefono, nombre_contacto, correo, direccion = _validar_datos_proveedor(
         nombre, telefono, nombre_contacto, correo, direccion)
     if _existe_proveedor_con_nombre(conexion, nombre, excluir_id=id_proveedor):
@@ -460,12 +506,11 @@ def _validar_datos_cliente(nombre, telefono, correo, direccion):
 
 def _existe_cliente_duplicado(conexion, nombre, telefono, excluir_id=None):
     """Mismo nombre y mismo teléfono (incluye el caso de ambos sin teléfono)."""
-    fila = conexion.execute(
-        """SELECT 1 FROM clientes
-           WHERE nombre = ? COLLATE NOCASE AND telefono IS ? AND id_cliente IS NOT ?""",
-        (nombre, telefono, excluir_id),
-    ).fetchone()
-    return fila is not None
+    buscado = _normalizar_nombre(nombre)
+    return any(fila["id_cliente"] != excluir_id
+               and _normalizar_nombre(fila["nombre"]) == buscado
+               for fila in conexion.execute(
+                   "SELECT id_cliente, nombre FROM clientes WHERE telefono IS ?", (telefono,)))
 
 
 def crear_cliente(conexion, nombre, telefono=None, correo=None, direccion=None):
@@ -497,7 +542,7 @@ def obtener_cliente(conexion, id_cliente):
 
 
 def modificar_cliente(conexion, id_cliente, nombre, telefono=None, correo=None, direccion=None):
-    obtener_cliente(conexion, id_cliente)
+    id_cliente = obtener_cliente(conexion, id_cliente)["id_cliente"]
     nombre, telefono, correo, direccion = _validar_datos_cliente(nombre, telefono, correo, direccion)
     if _existe_cliente_duplicado(conexion, nombre, telefono, excluir_id=id_cliente):
         raise ErrorNegocio("Ya existe otro cliente con el mismo nombre y teléfono.")
@@ -536,7 +581,9 @@ def _consolidar_items(items, con_precio):
         raise ErrorNegocio("Debe incluir al menos un producto.")
     consolidado = {}
     for item in items:
-        id_producto = item[0]
+        if not isinstance(item, (tuple, list)) or len(item) != (3 if con_precio else 2):
+            raise ErrorNegocio("Una línea tiene un formato inválido.")
+        id_producto = _entero(item[0], "Identificador del producto", 1)
         cantidad = _entero(item[1], "Cantidad", 1)
         if con_precio:
             precio = _numero_no_negativo(item[2], "Precio unitario")
@@ -545,7 +592,8 @@ def _consolidar_items(items, con_precio):
             precio = None
             clave = (id_producto, None)
         if clave in consolidado:
-            consolidado[clave]["cantidad"] += cantidad
+            consolidado[clave]["cantidad"] = _entero(
+                consolidado[clave]["cantidad"] + cantidad, "Cantidad total", 1)
         else:
             consolidado[clave] = {"id_producto": id_producto, "cantidad": cantidad, "precio": precio}
     return list(consolidado.values())
@@ -560,13 +608,34 @@ def _validar_metodo_pago(metodo_pago):
     raise ErrorNegocio("Método de pago inválido. Opciones: " + ", ".join(METODOS_PAGO) + ".")
 
 
-def registrar_venta(conexion, items, id_cliente=None, metodo_pago=METODO_PAGO_POR_DEFECTO):
+def calcular_cobro(total, metodo_pago=METODO_PAGO_POR_DEFECTO, monto_recibido=None):
+    """Valida el cobro y devuelve monto recibido/vuelto para pagos en efectivo.
+
+    None conserva la compatibilidad con ventas anteriores sin cobro documentado.
+    Tarjeta y SINPE no registran efectivo recibido ni vuelto.
+    """
+    total = _numero_no_negativo(total, "Total de la venta")
+    metodo_pago = _validar_metodo_pago(metodo_pago)
+    if metodo_pago != "Efectivo" or monto_recibido is None:
+        return {"monto_recibido": None, "vuelto": None}
+    recibido = _numero_no_negativo(monto_recibido, "Monto recibido")
+    if recibido < total:
+        faltante = round(total - recibido, 2)
+        raise ErrorNegocio(f"El efectivo recibido es insuficiente. Faltan ₡{faltante:,.2f}.")
+    return {"monto_recibido": recibido, "vuelto": round(recibido - total, 2)}
+
+
+def registrar_venta(conexion, items, id_cliente=None, metodo_pago=METODO_PAGO_POR_DEFECTO,
+                    monto_recibido=None, total_esperado=None):
     """
     Registra una venta y descuenta el stock en UNA sola transacción.
 
     items: [(id_producto, cantidad), ...]
     id_cliente: None => venta a cliente general.
     metodo_pago: 'Efectivo' (por defecto), 'Tarjeta' o 'SINPE'.
+    monto_recibido: opcional para compatibilidad; en efectivo, valida el total real
+    dentro de la transacción y guarda el vuelto. La pantalla de ventas lo exige.
+    total_esperado: si se indica, rechaza cambios de precio ocurridos al confirmar.
     El precio unitario SIEMPRE se lee de la BD (productos.precio_venta).
     Devuelve el id de la venta. Ante cualquier error hace ROLLBACK y lanza ErrorNegocio.
     """
@@ -574,14 +643,16 @@ def registrar_venta(conexion, items, id_cliente=None, metodo_pago=METODO_PAGO_PO
     lineas = _consolidar_items(items, con_precio=False)
     try:
         with transaccion(conexion):
+            nombre_cliente = "Cliente General"
             if id_cliente:
                 cliente = conexion.execute(
-                    "SELECT estado FROM clientes WHERE id_cliente = ?", (id_cliente,)
+                    "SELECT nombre, estado FROM clientes WHERE id_cliente = ?", (id_cliente,)
                 ).fetchone()
                 if cliente is None:
                     raise ErrorNegocio("El cliente no existe.")
                 if cliente["estado"] != ESTADO_ACTIVO:
                     raise ErrorNegocio("El cliente seleccionado está inactivo.")
+                nombre_cliente = cliente["nombre"]
             else:
                 id_cliente = None
 
@@ -598,12 +669,21 @@ def registrar_venta(conexion, items, id_cliente=None, metodo_pago=METODO_PAGO_PO
                     raise ErrorNegocio(f"El producto '{producto['nombre']}' está inactivo.")
                 precio = producto["precio_venta"]
                 detalles.append((linea["id_producto"], producto["nombre"], linea["cantidad"],
-                                 precio, round(precio * linea["cantidad"], 2)))
+                                 precio, _numero_no_negativo(
+                                     precio * linea["cantidad"], "Subtotal de la venta")))
 
-            total = round(sum(d[4] for d in detalles), 2)
+            total = _numero_no_negativo(sum(d[4] for d in detalles), "Total de la venta")
+            if (total_esperado is not None
+                    and total != _numero_no_negativo(total_esperado, "Total confirmado")):
+                raise ErrorNegocio("El total cambió mientras confirmaba la venta. "
+                                   "Revise los precios y confirme de nuevo.")
+            cobro = calcular_cobro(total, metodo_pago, monto_recibido)
             id_venta = conexion.execute(
-                "INSERT INTO ventas (id_cliente, total, metodo_pago) VALUES (?, ?, ?)",
-                (id_cliente, total, metodo_pago)
+                """INSERT INTO ventas (id_cliente, total, metodo_pago, nombre_cliente_historico,
+                                      monto_recibido, vuelto)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (id_cliente, total, metodo_pago, nombre_cliente,
+                 cobro["monto_recibido"], cobro["vuelto"])
             ).lastrowid
 
             for id_producto, nombre, cantidad, precio, subtotal in detalles:
@@ -621,9 +701,10 @@ def registrar_venta(conexion, items, id_cliente=None, metodo_pago=METODO_PAGO_PO
                         f"Stock insuficiente para '{nombre}'. Disponible: {disponible}, solicitado: {cantidad}."
                     )
                 conexion.execute(
-                    """INSERT INTO detalle_ventas (id_venta, id_producto, cantidad, precio_unitario, subtotal)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (id_venta, id_producto, cantidad, precio, subtotal),
+                    """INSERT INTO detalle_ventas (id_venta, id_producto, cantidad, precio_unitario,
+                                                   subtotal, nombre_producto_historico)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (id_venta, id_producto, cantidad, precio, subtotal, nombre),
                 )
         return id_venta
     except sqlite3.Error as error:
@@ -680,19 +761,23 @@ def _normalizar_items_compra(items):
         if isinstance(item, dict):
             datos = item
         else:
-            if not 3 <= len(item) <= len(CAMPOS_ITEM_COMPRA):
+            if (not isinstance(item, (tuple, list))
+                    or not 3 <= len(item) <= len(CAMPOS_ITEM_COMPRA)):
                 raise ErrorNegocio("Una línea de la compra tiene un formato inválido.")
             datos = dict(zip(CAMPOS_ITEM_COMPRA, item))
         for obligatorio in ("id_producto", "cantidad", "precio_compra"):
             if obligatorio not in datos:
                 raise ErrorNegocio(f"Falta el dato '{obligatorio}' en una línea de la compra.")
 
-        id_producto = datos["id_producto"]
+        id_producto = _entero(datos["id_producto"], "Identificador del producto", 1)
         cantidad = _entero(datos["cantidad"], "Cantidad", 1)
         precio = _numero_no_negativo(datos["precio_compra"], "Precio unitario")
         clave = (id_producto, precio)
         if clave in consolidado:
-            consolidado[clave]["cantidad"] += cantidad
+            # La línea más reciente queda al final, incluso si repite un costo.
+            anterior = consolidado.pop(clave)
+            anterior["cantidad"] = _entero(anterior["cantidad"] + cantidad, "Cantidad total", 1)
+            consolidado[clave] = anterior
         else:
             consolidado[clave] = {"id_producto": id_producto, "cantidad": cantidad, "precio": precio}
         # El último costo pagado queda como costo actual del producto (productos.precio_compra).
@@ -733,6 +818,7 @@ def registrar_compra(conexion, id_proveedor, items, nuevos_precios_venta=None):
     try:
         with transaccion(conexion):
             _validar_proveedor_activo(conexion, id_proveedor)
+            nombre_proveedor = obtener_proveedor(conexion, id_proveedor)["nombre"]
 
             detalles = []
             for linea in lineas:
@@ -745,23 +831,24 @@ def registrar_compra(conexion, id_proveedor, items, nuevos_precios_venta=None):
                 if producto["estado"] != ESTADO_ACTIVO:
                     raise ErrorNegocio(f"El producto '{producto['nombre']}' está inactivo.")
                 detalles.append((linea["id_producto"], linea["cantidad"], linea["precio"],
-                                 round(linea["precio"] * linea["cantidad"], 2)))
+                                 _numero_no_negativo(linea["precio"] * linea["cantidad"],
+                                                     "Subtotal de la compra"),
+                                 producto["nombre"]))
 
-            total = round(sum(d[3] for d in detalles), 2)
+            total = _numero_no_negativo(sum(d[3] for d in detalles), "Total de la compra")
             id_compra = conexion.execute(
-                "INSERT INTO compras (id_proveedor, total) VALUES (?, ?)", (id_proveedor, total)
+                """INSERT INTO compras (id_proveedor, total, nombre_proveedor_historico)
+                   VALUES (?, ?, ?)""", (id_proveedor, total, nombre_proveedor)
             ).lastrowid
 
-            for id_producto, cantidad, precio, subtotal in detalles:
+            for id_producto, cantidad, precio, subtotal, nombre in detalles:
                 conexion.execute(
-                    """INSERT INTO detalle_compras (id_compra, id_producto, cantidad, precio_unitario, subtotal)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (id_compra, id_producto, cantidad, precio, subtotal),
+                    """INSERT INTO detalle_compras (id_compra, id_producto, cantidad, precio_unitario,
+                                                    subtotal, nombre_producto_historico)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (id_compra, id_producto, cantidad, precio, subtotal, nombre),
                 )
-                conexion.execute(
-                    "UPDATE productos SET existencia = existencia + ? WHERE id_producto = ?",
-                    (cantidad, id_producto),
-                )
+                _ajustar_stock(conexion, id_producto, cantidad)
 
             # Costo nuevo y, si se enviaron, precio de venta e impuesto/utilidad nuevos.
             # Los nombres de columna salen de _ACTUALIZACIONES_PRODUCTO, nunca del usuario.
@@ -854,7 +941,10 @@ def generar_ticket_venta(conexion, id_venta, carpeta=None):
     """
     venta = conexion.execute(
         """SELECT v.id_venta, v.fecha_hora, v.total, v.anulada, v.metodo_pago,
-                  COALESCE(c.nombre, 'Cliente General') AS cliente
+                  v.monto_recibido, v.vuelto,
+                  COALESCE(v.nombre_cliente_historico, c.nombre,
+                           CASE WHEN v.id_cliente IS NULL THEN 'Cliente General'
+                                ELSE 'Cliente no disponible' END) AS cliente
            FROM ventas v LEFT JOIN clientes c ON c.id_cliente = v.id_cliente
            WHERE v.id_venta = ?""", (id_venta,)).fetchone()
     if venta is None:
@@ -884,8 +974,11 @@ def generar_ticket_venta(conexion, id_venta, carpeta=None):
             f"  {d['cantidad']} x {d['precio_unitario']:,.2f}", f"{d['subtotal']:,.2f}"))
     lineas += [simple,
                _linea_dos_columnas("TOTAL:", f"₡{venta['total']:,.2f}"),
-               _linea_dos_columnas("Método de pago:", venta["metodo_pago"]),
-               doble, "¡Gracias por su compra!".center(ancho), doble]
+               _linea_dos_columnas("Método de pago:", venta["metodo_pago"])]
+    if venta["metodo_pago"] == "Efectivo" and venta["monto_recibido"] is not None:
+        lineas += [_linea_dos_columnas("Efectivo recibido:", f"₡{venta['monto_recibido']:,.2f}"),
+                   _linea_dos_columnas("Vuelto:", f"₡{venta['vuelto']:,.2f}")]
+    lineas += [doble, "¡Gracias por su compra!".center(ancho), doble]
 
     carpeta = carpeta or CARPETA_PROYECTO
     try:
@@ -928,6 +1021,11 @@ def _ajustar_stock(conexion, id_producto, cambio):
     """
     if cambio == 0:
         return
+    producto = obtener_producto(conexion, id_producto)
+    nueva_existencia = producto["existencia"] + cambio
+    if nueva_existencia > ENTERO_MAXIMO_BD:
+        raise ErrorNegocio(
+            f"La operación supera la existencia máxima de '{producto['nombre']}'.")
     cursor = conexion.execute(
         "UPDATE productos SET existencia = existencia + ? "
         "WHERE id_producto = ? AND existencia + ? >= 0",
@@ -943,7 +1041,32 @@ def _ajustar_stock(conexion, id_producto, cambio):
         )
 
 
-def listar_ventas(conexion, busqueda="", incluir_anuladas=True):
+def _filtros_historial(alias, fecha_inicio, fecha_fin, campo_entidad, id_entidad):
+    """Filtros parametrizados compartidos; las fechas extremas son inclusivas."""
+    inicio = _validar_fecha(fecha_inicio, "fecha inicial")
+    fin = _validar_fecha(fecha_fin, "fecha final")
+    if inicio:
+        inicio = datetime.strptime(inicio, "%Y-%m-%d").strftime("%Y-%m-%d")
+    if fin:
+        fin = datetime.strptime(fin, "%Y-%m-%d").strftime("%Y-%m-%d")
+    if inicio and fin and inicio > fin:
+        raise ErrorNegocio("La fecha inicial no puede ser posterior a la fecha final.")
+    filtros, parametros = [], []
+    if inicio:
+        filtros.append(f"date({alias}.fecha_hora) >= ?")
+        parametros.append(inicio)
+    if fin:
+        filtros.append(f"date({alias}.fecha_hora) <= ?")
+        parametros.append(fin)
+    if id_entidad is not None:
+        filtros.append(f"{alias}.{campo_entidad} = ?")
+        parametros.append(_entero(id_entidad, "Identificador del filtro", 1))
+    return "".join(" AND " + filtro for filtro in filtros), parametros
+
+
+def listar_ventas(conexion, busqueda="", incluir_anuladas=True, *,
+                  fecha_inicio=None, fecha_fin=None, id_cliente=None,
+                  solo_cliente_general=False):
     """
     Historial de ventas (más recientes primero). Busca por N.º, fecha o cliente.
     Las anuladas se incluyen por defecto (columna `anulada` = 1) para auditoría;
@@ -951,19 +1074,31 @@ def listar_ventas(conexion, busqueda="", incluir_anuladas=True):
     """
     patron = f"%{busqueda.strip()}%"
     filtro_anuladas = "" if incluir_anuladas else " AND v.anulada = 0"
+    filtros, parametros = _filtros_historial(
+        "v", fecha_inicio, fecha_fin, "id_cliente", id_cliente)
+    if solo_cliente_general:
+        if id_cliente is not None:
+            raise ErrorNegocio("Seleccione un cliente registrado o Cliente General.")
+        filtros += " AND v.id_cliente IS NULL"
     return conexion.execute(
         """SELECT v.id_venta, v.fecha_hora, v.total, v.id_cliente, v.anulada, v.metodo_pago,
-                  COALESCE(c.nombre, 'Cliente General') AS cliente
+                  v.monto_recibido, v.vuelto,
+                  COALESCE(v.nombre_cliente_historico, c.nombre,
+                           CASE WHEN v.id_cliente IS NULL THEN 'Cliente General'
+                                ELSE 'Cliente no disponible' END) AS cliente
            FROM ventas v LEFT JOIN clientes c ON c.id_cliente = v.id_cliente
            WHERE (CAST(v.id_venta AS TEXT) LIKE ? OR v.fecha_hora LIKE ?
-                  OR COALESCE(c.nombre, 'Cliente General') LIKE ?)"""
-        + filtro_anuladas +
+                  OR COALESCE(v.nombre_cliente_historico, c.nombre,
+                              CASE WHEN v.id_cliente IS NULL THEN 'Cliente General'
+                                   ELSE 'Cliente no disponible' END) LIKE ?)"""
+        + filtro_anuladas + filtros +
         """ ORDER BY v.fecha_hora DESC, v.id_venta DESC""",
-        (patron, patron, patron),
+        [patron, patron, patron] + parametros,
     ).fetchall()
 
 
-def listar_compras(conexion, busqueda="", incluir_anuladas=True):
+def listar_compras(conexion, busqueda="", incluir_anuladas=True, *,
+                   fecha_inicio=None, fecha_fin=None, id_proveedor=None):
     """
     Historial de compras (más recientes primero). Busca por N.º, fecha o proveedor.
     Las anuladas se incluyen por defecto (columna `anulada` = 1) para auditoría;
@@ -971,22 +1106,36 @@ def listar_compras(conexion, busqueda="", incluir_anuladas=True):
     """
     patron = f"%{busqueda.strip()}%"
     filtro_anuladas = "" if incluir_anuladas else " AND c.anulada = 0"
+    filtros, parametros = _filtros_historial(
+        "c", fecha_inicio, fecha_fin, "id_proveedor", id_proveedor)
     return conexion.execute(
         """SELECT c.id_compra, c.fecha_hora, c.total, c.id_proveedor, c.anulada,
-                  p.nombre AS proveedor
-           FROM compras c JOIN proveedores p ON p.id_proveedor = c.id_proveedor
-           WHERE (CAST(c.id_compra AS TEXT) LIKE ? OR c.fecha_hora LIKE ? OR p.nombre LIKE ?)"""
-        + filtro_anuladas +
+                  COALESCE(c.nombre_proveedor_historico, p.nombre,
+                           'Proveedor no disponible') AS proveedor
+           FROM compras c LEFT JOIN proveedores p ON p.id_proveedor = c.id_proveedor
+           WHERE (CAST(c.id_compra AS TEXT) LIKE ? OR c.fecha_hora LIKE ?
+                  OR COALESCE(c.nombre_proveedor_historico, p.nombre,
+                              'Proveedor no disponible') LIKE ?)"""
+        + filtro_anuladas + filtros +
         """ ORDER BY c.fecha_hora DESC, c.id_compra DESC""",
-        (patron, patron, patron),
+        [patron, patron, patron] + parametros,
     ).fetchall()
+
+
+def obtener_ultima_venta(conexion):
+    """Última venta registrada, incluso anulada; no depende de archivos de tickets."""
+    return conexion.execute(
+        "SELECT id_venta, fecha_hora, anulada FROM ventas ORDER BY id_venta DESC LIMIT 1"
+    ).fetchone()
 
 
 def obtener_detalle_venta(conexion, id_venta):
     return conexion.execute(
-        """SELECT d.id_detalle_venta, d.id_producto, p.nombre AS producto,
+        """SELECT d.id_detalle_venta, d.id_producto,
+                  COALESCE(d.nombre_producto_historico, p.nombre,
+                           'Producto no disponible') AS producto,
                   d.cantidad, d.precio_unitario, d.subtotal
-           FROM detalle_ventas d JOIN productos p ON p.id_producto = d.id_producto
+           FROM detalle_ventas d LEFT JOIN productos p ON p.id_producto = d.id_producto
            WHERE d.id_venta = ? ORDER BY d.id_detalle_venta""",
         (id_venta,),
     ).fetchall()
@@ -994,9 +1143,11 @@ def obtener_detalle_venta(conexion, id_venta):
 
 def obtener_detalle_compra(conexion, id_compra):
     return conexion.execute(
-        """SELECT d.id_detalle_compra, d.id_producto, p.nombre AS producto,
+        """SELECT d.id_detalle_compra, d.id_producto,
+                  COALESCE(d.nombre_producto_historico, p.nombre,
+                           'Producto no disponible') AS producto,
                   d.cantidad, d.precio_unitario, d.subtotal
-           FROM detalle_compras d JOIN productos p ON p.id_producto = d.id_producto
+           FROM detalle_compras d LEFT JOIN productos p ON p.id_producto = d.id_producto
            WHERE d.id_compra = ? ORDER BY d.id_detalle_compra""",
         (id_compra,),
     ).fetchall()
@@ -1052,20 +1203,29 @@ def eliminar_compra(conexion, id_compra):
     _anular_transaccion(conexion, "compra", id_compra)
 
 
-def _editar_transaccion(conexion, tipo, id_transaccion, lineas):
+def _editar_transaccion(conexion, tipo, id_transaccion, lineas, monto_recibido=_SIN_CAMBIOS):
     """
     lineas: [(id_detalle, cantidad_nueva, precio_nuevo), ...]
     Solo se modifican cantidades y precios; fecha e identificador no cambian.
     El stock se ajusta según la DIFERENCIA de cantidades y el total se recalcula.
     """
     cfg = _TIPOS_TRANSACCION[tipo]
-    if not lineas:
+    if not isinstance(lineas, (list, tuple)) or not lineas:
         raise ErrorNegocio("No hay líneas para modificar.")
-    # Validación de datos antes de abrir la transacción.
-    validadas = [(id_detalle,
-                  _entero(cantidad, "Cantidad", 1),
-                  _numero_no_negativo(precio, "Precio unitario"))
-                 for id_detalle, cantidad, precio in lineas]
+    # Validar y rechazar IDs repetidos antes de cambiar el inventario.
+    validadas = []
+    vistos = set()
+    for linea in lineas:
+        if not isinstance(linea, (tuple, list)) or len(linea) != 3:
+            raise ErrorNegocio("Una línea de edición tiene un formato inválido.")
+        id_detalle = _entero(linea[0], "Identificador del detalle", 1)
+        if id_detalle in vistos:
+            raise ErrorNegocio("El mismo detalle aparece más de una vez. Revise las líneas.")
+        vistos.add(id_detalle)
+        cantidad = _entero(linea[1], "Cantidad", 1)
+        precio = _numero_no_negativo(linea[2], "Precio unitario")
+        subtotal = _numero_no_negativo(cantidad * precio, "Subtotal")
+        validadas.append((id_detalle, cantidad, precio, subtotal))
     try:
         with transaccion(conexion):
             _exigir_transaccion_vigente(conexion, cfg, tipo, id_transaccion)
@@ -1075,37 +1235,56 @@ def _editar_transaccion(conexion, tipo, id_transaccion, lineas):
                     (id_transaccion,)).fetchall()
             }
             cambios_stock = {}
-            for id_detalle, cantidad, _precio in validadas:
+            subtotales = {identificador: fila["subtotal"]
+                          for identificador, fila in actuales.items()}
+            for id_detalle, cantidad, _precio, subtotal in validadas:
                 if id_detalle not in actuales:
                     raise ErrorNegocio("Una de las líneas no pertenece a esta transacción.")
                 anterior = actuales[id_detalle]
+                subtotales[id_detalle] = subtotal
                 diferencia = cantidad - anterior["cantidad"]
                 cambios_stock[anterior["id_producto"]] = (
                     cambios_stock.get(anterior["id_producto"], 0) + cfg["signo_stock"] * diferencia)
+            total = _numero_no_negativo(sum(subtotales.values()), "Total de la transacción")
+            cobro = None
+            if tipo == "venta":
+                venta = conexion.execute(
+                    "SELECT metodo_pago, monto_recibido FROM ventas WHERE id_venta = ?",
+                    (id_transaccion,),
+                ).fetchone()
+                recibido = (venta["monto_recibido"] if monto_recibido is _SIN_CAMBIOS
+                            else monto_recibido)
+                if (venta["metodo_pago"] == "Efectivo" and recibido is None
+                        and venta["monto_recibido"] is not None):
+                    raise ErrorNegocio("No se puede borrar el efectivo recibido de una venta registrada.")
+                cobro = calcular_cobro(total, venta["metodo_pago"], recibido)
             for id_producto, cambio in cambios_stock.items():
                 _ajustar_stock(conexion, id_producto, cambio)
-            for id_detalle, cantidad, precio in validadas:
+            for id_detalle, cantidad, precio, subtotal in validadas:
                 conexion.execute(
                     f"UPDATE {cfg['detalle']} SET cantidad = ?, precio_unitario = ?, subtotal = ? "
                     f"WHERE {cfg['id_detalle']} = ?",
-                    (cantidad, precio, round(cantidad * precio, 2), id_detalle),
+                    (cantidad, precio, subtotal, id_detalle),
                 )
             conexion.execute(
-                f"UPDATE {cfg['padre']} SET total = "
-                f"(SELECT ROUND(SUM(subtotal), 2) FROM {cfg['detalle']} WHERE {cfg['id_padre']} = ?) "
-                f"WHERE {cfg['id_padre']} = ?",
-                (id_transaccion, id_transaccion),
+                f"UPDATE {cfg['padre']} SET total = ? WHERE {cfg['id_padre']} = ?",
+                (total, id_transaccion),
             )
-            return conexion.execute(
-                f"SELECT total FROM {cfg['padre']} WHERE {cfg['id_padre']} = ?", (id_transaccion,)
-            ).fetchone()["total"]
+            if cobro is not None:
+                conexion.execute("UPDATE ventas SET monto_recibido = ?, vuelto = ? WHERE id_venta = ?",
+                                 (cobro["monto_recibido"], cobro["vuelto"], id_transaccion))
+            return total
     except sqlite3.Error as error:
         raise ErrorNegocio(f"No se pudo modificar la {tipo}: {error}")
 
 
-def editar_venta(conexion, id_venta, lineas):
-    """Modifica cantidades/precios de una venta y ajusta el stock. Devuelve el nuevo total."""
-    return _editar_transaccion(conexion, "venta", id_venta, lineas)
+def editar_venta(conexion, id_venta, lineas, monto_recibido=_SIN_CAMBIOS):
+    """Corrige cantidades/precios y, opcionalmente, efectivo; guarda todo junto.
+
+    Si se omite monto_recibido se conserva el registrado. Una venta histórica
+    sin cobro documentado puede mantenerlo vacío. Devuelve el nuevo total.
+    """
+    return _editar_transaccion(conexion, "venta", id_venta, lineas, monto_recibido)
 
 
 def editar_compra(conexion, id_compra, lineas):
