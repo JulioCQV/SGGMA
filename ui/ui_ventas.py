@@ -6,6 +6,7 @@ Módulo de Ventas: selección de cliente, carrito temporal y confirmación.
 - El método de pago (Efectivo, Tarjeta o SINPE) se elige antes de confirmar y se guarda en la venta.
 - El carrito vive en memoria; no toca la BD ni el inventario hasta "Confirmar Venta",
   que llama a servicios.registrar_venta (transacción con COMMIT / ROLLBACK).
+  
 """
 
 import re
