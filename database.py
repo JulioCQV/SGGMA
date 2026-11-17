@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS compras (
     id_proveedor  INTEGER NOT NULL,
     total         REAL    NOT NULL CHECK (total >= 0),
     anulada       INTEGER NOT NULL DEFAULT 0 CHECK (anulada IN (0, 1)),  -- 1 = anulada (auditoría)
+    nombre_proveedor_historico TEXT,                 -- nombre al registrar la compra
     FOREIGN KEY (id_proveedor) REFERENCES proveedores (id_proveedor)
 );
 
@@ -146,6 +147,7 @@ CREATE TABLE IF NOT EXISTS detalle_compras (
     cantidad           INTEGER NOT NULL CHECK (cantidad > 0),
     precio_unitario    REAL    NOT NULL CHECK (precio_unitario >= 0),  -- precio REAL pagado
     subtotal           REAL    NOT NULL CHECK (subtotal >= 0),
+    nombre_producto_historico TEXT,                  -- nombre al registrar el detalle
     FOREIGN KEY (id_compra)   REFERENCES compras   (id_compra) ON DELETE CASCADE,
     FOREIGN KEY (id_producto) REFERENCES productos (id_producto)
 );
@@ -158,6 +160,9 @@ CREATE TABLE IF NOT EXISTS ventas (
     anulada      INTEGER NOT NULL DEFAULT 0 CHECK (anulada IN (0, 1)),  -- 1 = anulada (auditoría)
     metodo_pago  TEXT    NOT NULL DEFAULT 'Efectivo'
                          CHECK (metodo_pago IN ('Efectivo', 'Tarjeta', 'SINPE')),
+    nombre_cliente_historico TEXT,                   -- nombre al registrar la venta
+    monto_recibido REAL CHECK (monto_recibido IS NULL OR monto_recibido >= 0),
+    vuelto        REAL CHECK (vuelto IS NULL OR vuelto >= 0),
     FOREIGN KEY (id_cliente) REFERENCES clientes (id_cliente)
 );
 
@@ -168,6 +173,7 @@ CREATE TABLE IF NOT EXISTS detalle_ventas (
     cantidad          INTEGER NOT NULL CHECK (cantidad > 0),
     precio_unitario   REAL    NOT NULL CHECK (precio_unitario >= 0),  -- copiado de productos.precio_venta
     subtotal          REAL    NOT NULL CHECK (subtotal >= 0),
+    nombre_producto_historico TEXT,                  -- nombre al registrar el detalle
     FOREIGN KEY (id_venta)    REFERENCES ventas    (id_venta) ON DELETE CASCADE,
     FOREIGN KEY (id_producto) REFERENCES productos (id_producto)
 );
@@ -190,6 +196,8 @@ CREATE INDEX IF NOT EXISTS idx_detventas_producto    ON detalle_ventas  (id_prod
 # CREATE TABLE IF NOT EXISTS NO modifica tablas existentes, así que las bases creadas
 # antes de estos cambios las reciben aquí con ALTER TABLE, conservando todos los datos.
 COLUMNAS_NUEVAS = [
+    ("ventas", "monto_recibido", "REAL CHECK (monto_recibido IS NULL OR monto_recibido >= 0)"),
+    ("ventas", "vuelto", "REAL CHECK (vuelto IS NULL OR vuelto >= 0)"),
     ("ventas", "anulada",
      "INTEGER NOT NULL DEFAULT 0 CHECK (anulada IN (0, 1))"),
     ("compras", "anulada",
@@ -245,11 +253,56 @@ def _migrar_restriccion_telefono(conexion):
             conexion.execute("PRAGMA foreign_keys = ON")
 
 
+def _migrar_nombres_historicos(conexion):
+    """Congela nombres de operaciones anteriores sin reemplazar copias ya guardadas.
+
+    Una base antigua solo permite recuperar el nombre que existe al actualizar.
+    Los nombres que se hubieran cambiado antes no se pueden reconstruir.
+    Columnas y datos históricos se actualizan juntos; ante un error se revierten.
+    """
+    columnas = (
+        ("ventas", "nombre_cliente_historico"),
+        ("compras", "nombre_proveedor_historico"),
+        ("detalle_ventas", "nombre_producto_historico"),
+        ("detalle_compras", "nombre_producto_historico"),
+    )
+    with transaccion(conexion):
+        for tabla, columna in columnas:
+            existentes = {fila["name"] for fila in conexion.execute(f"PRAGMA table_info({tabla})")}
+            if columna not in existentes:
+                conexion.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} TEXT")
+
+        conexion.execute("""
+            UPDATE ventas SET nombre_cliente_historico =
+                CASE WHEN id_cliente IS NULL THEN 'Cliente General'
+                     ELSE COALESCE((SELECT nombre FROM clientes
+                                    WHERE clientes.id_cliente = ventas.id_cliente),
+                                   'Cliente no disponible') END
+            WHERE nombre_cliente_historico IS NULL
+        """)
+        conexion.execute("""
+            UPDATE compras SET nombre_proveedor_historico =
+                COALESCE((SELECT nombre FROM proveedores
+                          WHERE proveedores.id_proveedor = compras.id_proveedor),
+                         'Proveedor no disponible')
+            WHERE nombre_proveedor_historico IS NULL
+        """)
+        for tabla in ("detalle_ventas", "detalle_compras"):
+            conexion.execute(f"""
+                UPDATE {tabla} SET nombre_producto_historico =
+                    COALESCE((SELECT nombre FROM productos
+                              WHERE productos.id_producto = {tabla}.id_producto),
+                             'Producto no disponible')
+                WHERE nombre_producto_historico IS NULL
+            """)
+
+
 def crear_tablas(conexion):
     """Crea todas las tablas e índices si todavía no existen (y migra bases antiguas)."""
     conexion.executescript(ESQUEMA_SQL)
     _migrar_columnas_nuevas(conexion)
     _migrar_restriccion_telefono(conexion)
+    _migrar_nombres_historicos(conexion)
 
 
 def inicializar_base_datos(ruta_bd=None):
@@ -258,7 +311,11 @@ def inicializar_base_datos(ruta_bd=None):
     devuelve la conexión lista para usar.
     """
     conexion = obtener_conexion(ruta_bd)
-    crear_tablas(conexion)
+    try:
+        crear_tablas(conexion)
+    except Exception:
+        conexion.close()
+        raise
     return conexion
 
 
