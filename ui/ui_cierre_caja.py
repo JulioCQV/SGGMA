@@ -5,6 +5,8 @@ Los datos vienen de servicios.obtener_cierre_caja_diario; las anuladas no cuenta
 """
 
 import tkinter as tk
+import sqlite3
+from datetime import date
 from tkinter import ttk, messagebox
 
 import servicios
@@ -32,10 +34,16 @@ class VentanaCierreCaja(tk.Toplevel):
         super().__init__(padre)
         self.conexion = conexion
         self.title("Cierre de Caja")
-        self.geometry("620x560")
-        self.minsize(540, 500)
+        ancho = min(760, self.winfo_screenwidth() - 60)
+        alto = min(640, self.winfo_screenheight() - 100)
+        self.geometry(f"{ancho}x{alto}")
+        self.minsize(min(600, ancho), min(540, alto))
 
         self.var_fecha = tk.StringVar()
+        self.var_periodo = tk.StringVar()
+        self._modo_hoy = True
+        self._fecha_consultada = None
+        self._texto_fecha_aplicado = ""
         self.var_total_vendido = tk.StringVar()
         self.var_detalle_ventas = tk.StringVar()
         self.var_total_comprado = tk.StringVar()
@@ -61,10 +69,14 @@ class VentanaCierreCaja(tk.Toplevel):
         # Encabezado: título y fecha
         cabecera = ttk.Frame(marco)
         cabecera.pack(fill="x")
-        ttk.Label(cabecera, text="Cierre de Caja", style="CajaTitulo.TLabel").pack(side="left")
-        ttk.Button(cabecera, text="Hoy", width=6, command=self.ir_a_hoy).pack(side="right")
-        ttk.Button(cabecera, text="Ver", width=6, command=self.actualizar).pack(side="right", padx=6)
-        entrada = ttk.Entry(cabecera, textvariable=self.var_fecha, width=12, justify="center",
+        ttk.Label(cabecera, text="Cierre de Caja", style="CajaTitulo.TLabel").pack(anchor="w")
+        ttk.Label(cabecera, textvariable=self.var_periodo).pack(anchor="w", pady=(3, 8))
+        controles = ttk.Frame(marco)
+        controles.pack(fill="x")
+        ttk.Label(controles, text="Fecha (DD/MM/AAAA):").pack(side="left", padx=(0, 8))
+        ttk.Button(controles, text="Hoy", width=6, command=self.ir_a_hoy).pack(side="right")
+        ttk.Button(controles, text="Ver", width=6, command=self.actualizar).pack(side="right", padx=6)
+        entrada = ttk.Entry(controles, textvariable=self.var_fecha, width=12, justify="center",
                             validate="key", validatecommand=(self.register(_solo_fecha), "%P"))
         entrada.pack(side="right")
         entrada.bind("<Return>", lambda _e: self.actualizar())
@@ -104,13 +116,31 @@ class VentanaCierreCaja(tk.Toplevel):
     def actualizar(self):
         """Consulta el cierre de la fecha indicada (vacía = hoy) y refresca la pantalla."""
         try:
-            fecha_bd = formato.a_fecha_iso(self.var_fecha.get())      # DD/MM/AAAA -> AAAA-MM-DD
-            cierre = servicios.obtener_cierre_caja_diario(self.conexion, fecha_bd or None)
-        except ErrorNegocio as error:
+            texto = self.var_fecha.get().strip()
+            fecha_bd = (None if self._modo_hoy and texto == self._texto_fecha_aplicado else
+                        formato.a_fecha_iso(texto) or None)
+            cierre = servicios.obtener_cierre_caja_diario(self.conexion, fecha_bd)
+        except (ErrorNegocio, sqlite3.Error) as error:
             messagebox.showwarning("Cierre de caja", str(error), parent=self)
             return
 
-        self.var_fecha.set(formato.formatear_fecha(cierre["fecha"]))
+        self._modo_hoy = fecha_bd is None or fecha_bd == date.today().isoformat()
+        self._mostrar_cierre(cierre, actualizar_fecha=True)
+
+    def actualizar_al_volver(self):
+        """Refresca la consulta aplicada sin borrar una fecha que se esté escribiendo."""
+        fecha = None if self._modo_hoy else self._fecha_consultada
+        cierre = servicios.obtener_cierre_caja_diario(self.conexion, fecha)
+        sin_edicion = self.var_fecha.get().strip() == self._texto_fecha_aplicado
+        self._mostrar_cierre(cierre, actualizar_fecha=sin_edicion)
+
+    def _mostrar_cierre(self, cierre, actualizar_fecha):
+        self._fecha_consultada = cierre["fecha"]
+        self._texto_fecha_aplicado = formato.formatear_fecha(cierre["fecha"])
+        if actualizar_fecha:
+            self.var_fecha.set(self._texto_fecha_aplicado)
+        self.var_periodo.set("Resumen de " + self._texto_fecha_aplicado +
+                             (" · Hoy" if self._modo_hoy else ""))
         self.var_total_vendido.set(_dinero(cierre["total_vendido"]))
         self.var_detalle_ventas.set(f"{cierre['cantidad_ventas']} ventas")
         self.var_total_comprado.set(_dinero(cierre["total_comprado"]))
