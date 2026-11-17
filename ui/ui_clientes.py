@@ -4,6 +4,7 @@ Módulo de Clientes: formulario de registro/edición + tabla de listado.
 Toda la lógica de negocio está en servicios.py; aquí solo hay interfaz.
 """
 
+import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -39,6 +40,8 @@ class VentanaClientes(tk.Toplevel):
         self._crear_tabla()
         self.var_busqueda.trace_add("write", lambda *_: self.cargar_tabla())
         self.cargar_tabla()
+        self._datos_cargados = self._datos_formulario()
+        self.protocol("WM_DELETE_WINDOW", self.cerrar)
         self.entrada_nombre.focus_set()
 
     # ------------------------------------------------------------------
@@ -115,7 +118,12 @@ class VentanaClientes(tk.Toplevel):
 
         scroll = ttk.Scrollbar(marco, orient="vertical", command=self.tabla.yview)
         scroll.grid(row=1, column=1, sticky="ns")
-        self.tabla.configure(yscrollcommand=scroll.set)
+        horizontal = ttk.Scrollbar(marco, orient="horizontal", command=self.tabla.xview)
+        horizontal.grid(row=2, column=0, sticky="ew")
+        self.tabla.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        self.var_resultados = tk.StringVar()
+        ttk.Label(marco, textvariable=self.var_resultados, foreground="#58685F").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.tabla.bind("<<TreeviewSelect>>", self.al_seleccionar_fila)
 
     # ------------------------------------------------------------------
@@ -135,11 +143,43 @@ class VentanaClientes(tk.Toplevel):
                 c["id_cliente"], c["nombre"], c["telefono"] or "", c["correo"] or "",
                 c["direccion"] or "", c["estado"].capitalize()))
 
+        self.var_resultados.set(f"{len(clientes)} registro(s)." if clientes else
+                                 "No se encontraron registros con esos filtros.")
+        if self.id_seleccionado is not None:
+            if str(self.id_seleccionado) in self.tabla.get_children():
+                self.tabla.selection_set(str(self.id_seleccionado))
+                self.boton_guardar.configure(state="normal")
+                registro = next(f for f in clientes if f["id_cliente"] == self.id_seleccionado)
+                activo = registro["estado"] == "activo"
+                self.marco_form.configure(text=f"Editar cliente (ID {self.id_seleccionado})")
+                self.boton_desactivar.configure(state="normal" if activo else "disabled")
+                self.boton_reactivar.configure(state="disabled" if activo else "normal")
+            elif self.hay_cambios_sin_guardar():
+                self.marco_form.configure(text="Edición pendiente: registro fuera del filtro")
+                self.boton_guardar.configure(state="disabled")
+                self.boton_desactivar.configure(state="disabled")
+                self.boton_reactivar.configure(state="disabled")
+            else:
+                self.limpiar_formulario(enfocar=False)
+
     def al_seleccionar_fila(self, _evento=None):
         seleccion = self.tabla.selection()
         if not seleccion:
             return
+        if self.id_seleccionado == int(seleccion[0]):
+            return
+        if self.hay_cambios_sin_guardar() and not messagebox.askyesno(
+                "Cambios sin guardar", "Hay datos escritos sin guardar. ¿Desea descartarlos y seleccionar otro registro?",
+                parent=self):
+            if self.id_seleccionado is not None and str(self.id_seleccionado) in self.tabla.get_children():
+                self.tabla.selection_set(str(self.id_seleccionado))
+            else:
+                self.tabla.selection_remove(self.tabla.selection())
+            return
         c = servicios.obtener_cliente(self.conexion, int(seleccion[0]))
+        self._cargar_registro(c)
+
+    def _cargar_registro(self, c):
         self.id_seleccionado = c["id_cliente"]
         self.var_nombre.set(c["nombre"])
         self.var_telefono.set(c["telefono"] or "")
@@ -150,7 +190,10 @@ class VentanaClientes(tk.Toplevel):
         self.boton_desactivar.configure(state="normal" if activo else "disabled")
         self.boton_reactivar.configure(state="disabled" if activo else "normal")
 
-    def limpiar_formulario(self):
+        self.boton_guardar.configure(text="Guardar cambios", state="normal")
+        self._datos_cargados = self._datos_formulario()
+
+    def limpiar_formulario(self, enfocar=True):
         self.id_seleccionado = None
         for variable in (self.var_nombre, self.var_telefono, self.var_correo, self.var_direccion):
             variable.set("")
@@ -158,10 +201,16 @@ class VentanaClientes(tk.Toplevel):
         self.boton_desactivar.configure(state="disabled")
         self.boton_reactivar.configure(state="disabled")
         self.tabla.selection_remove(self.tabla.selection())
-        self.entrada_nombre.focus_set()
+        self.boton_guardar.configure(text="Guardar", state="normal")
+        self._datos_cargados = self._datos_formulario()
+        if enfocar:
+            self.entrada_nombre.focus_set()
 
     def guardar(self):
         """Registra un cliente nuevo o actualiza el seleccionado."""
+        if self.id_seleccionado is not None and str(self.id_seleccionado) not in self.tabla.get_children():
+            messagebox.showwarning("Guardar", "El registro está fuera del filtro. Ajuste el filtro o pulse Limpiar.", parent=self)
+            return
         datos = (self.var_nombre.get(), self.var_telefono.get(),
                  self.var_correo.get(), self.var_direccion.get())
         try:
@@ -171,7 +220,7 @@ class VentanaClientes(tk.Toplevel):
             else:
                 servicios.modificar_cliente(self.conexion, self.id_seleccionado, *datos)
                 mensaje = "Cliente actualizado correctamente."
-        except ErrorNegocio as error:
+        except (ErrorNegocio, sqlite3.Error) as error:
             messagebox.showwarning("No se pudo guardar", str(error), parent=self)
             return
         messagebox.showinfo("Éxito", mensaje, parent=self)
@@ -188,19 +237,39 @@ class VentanaClientes(tk.Toplevel):
             return
         try:
             servicios.desactivar_cliente(self.conexion, self.id_seleccionado)
-        except ErrorNegocio as error:
+        except (ErrorNegocio, sqlite3.Error) as error:
             messagebox.showwarning("Error", str(error), parent=self)
             return
         self.limpiar_formulario()
         self.cargar_tabla()
+        messagebox.showinfo("Estado actualizado", "Registro desactivado correctamente.", parent=self)
 
     def reactivar(self):
         if self.id_seleccionado is None:
             return
         try:
             servicios.reactivar_cliente(self.conexion, self.id_seleccionado)
-        except ErrorNegocio as error:
+        except (ErrorNegocio, sqlite3.Error) as error:
             messagebox.showwarning("Error", str(error), parent=self)
             return
         self.limpiar_formulario()
         self.cargar_tabla()
+        messagebox.showinfo("Estado actualizado", "Registro reactivado correctamente.", parent=self)
+
+    def _datos_formulario(self):
+        return tuple(variable.get() for variable in (self.var_nombre, self.var_telefono, self.var_correo, self.var_direccion))
+
+    def hay_cambios_sin_guardar(self):
+        return self._datos_formulario() != self._datos_cargados
+
+    def actualizar_al_volver(self):
+        conservar_edicion = self.hay_cambios_sin_guardar()
+        self.cargar_tabla()
+        if not conservar_edicion and self.id_seleccionado is not None:
+            self._cargar_registro(servicios.obtener_cliente(self.conexion, self.id_seleccionado))
+
+    def cerrar(self):
+        if self.hay_cambios_sin_guardar() and not messagebox.askyesno(
+                "Cambios sin guardar", "Hay datos sin guardar. ¿Desea cerrar y descartarlos?", parent=self):
+            return
+        self.destroy()
