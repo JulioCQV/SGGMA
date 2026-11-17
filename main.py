@@ -1,8 +1,6 @@
-"""
-main.py
-Punto de entrada del SGGMA. Ejecutar con:  python main.py
-"""
+"""Punto de entrada del SGGMA. Ejecutar con: python main.py."""
 
+import sys
 import tkinter as tk
 from tkinter import messagebox
 
@@ -11,25 +9,40 @@ from ui.ui_principal import VentanaPrincipal
 
 
 def main():
-    # 1. Base de datos: crea el archivo y las tablas si no existen.
+    raiz = None
+    conexion = None
+    etapa = "interfaz"
     try:
+        # Una sola raíz permite mostrar también los errores de inicialización.
+        raiz = tk.Tk()
+        raiz.withdraw()
+        etapa = "base de datos"
         conexion = inicializar_base_datos()
+        etapa = "interfaz"
+        VentanaPrincipal(raiz, conexion)
+        raiz.deiconify()
+        raiz.mainloop()
     except Exception as error:
-        # Aún no hay ventana principal; usamos una raíz oculta solo para el mensaje.
-        raiz_temporal = tk.Tk()
-        raiz_temporal.withdraw()
-        messagebox.showerror("Error de base de datos",
-                             f"No se pudo abrir la base de datos:\n{error}")
-        raiz_temporal.destroy()
-        return
-
-    # 2. Interfaz: la conexión única se comparte con todas las ventanas.
-    raiz = tk.Tk()
-    VentanaPrincipal(raiz, conexion)
-    raiz.mainloop()
-
-    # 3. Al cerrar la aplicación se cierra la conexión.
-    conexion.close()
+        mensaje = f"No se pudo iniciar o ejecutar el sistema ({etapa}):\n{error}"
+        if raiz is not None:
+            try:
+                messagebox.showerror("Error del sistema", mensaje, parent=raiz)
+            except tk.TclError:
+                print(mensaje, file=sys.stderr)
+        else:
+            print(mensaje, file=sys.stderr)
+    finally:
+        # Se liberan los recursos también si falla la creación de alguna ventana.
+        try:
+            if conexion is not None:
+                conexion.close()
+        finally:
+            if raiz is not None:
+                try:
+                    if raiz.winfo_exists():
+                        raiz.destroy()
+                except tk.TclError:
+                    pass  # la ventana ya fue destruida al salir
 
 
 if __name__ == "__main__":
